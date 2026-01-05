@@ -20,8 +20,14 @@ def is_subprocess():
 
 
 def anonify(input_path, output_path, *, mode="head", temporal=True):
+    model_path = "./models/yolo11n.pt"
+    # If we are using pyinstaller, adjust the model path
+    if getattr(sys, "frozen", False):
+        base_path = sys._MEIPASS  # pyright: ignore[reportAttributeAccessIssue] # noqa: SLF001
+        model_path = Path(base_path) / "models" / "yolo11n.pt"
+
     # YOLO11-n is the 2026 sweet spot for CPU speed
-    model = YOLO("./models/yolo11n.pt")
+    model = YOLO(model_path)
 
     # 1. Open Input with PyAV
     container = av.open(input_path, mode="r")

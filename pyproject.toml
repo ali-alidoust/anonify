@@ -107,6 +107,11 @@ skip-magic-trailing-comma = false
 docstring-code-format = true
 docstring-code-line-length = 72
 
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.17.0",
+]
+
 [tool.ruff.lint.flake8-bugbear]
 # Enable additional checks
 extend-immutable-calls = []
