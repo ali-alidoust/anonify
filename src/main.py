@@ -1,17 +1,25 @@
-import argparse
 from collections import deque
+import math
+import os
+from pathlib import Path
 import secrets
+import sys
 
 import av
 from av.container.input import InputContainer
 import cv2
+from gooey import Gooey, GooeyParser
 import numpy as np
 import shortuuid
 from tqdm import tqdm
 from ultralytics.models.yolo import YOLO
 
 
-def anonify(input_path, output_path, mode="head", *, temporal=True):
+def is_subprocess():
+    return "GOOEY" in os.environ and os.environ["GOOEY"] == "1"
+
+
+def anonify(input_path, output_path, *, mode="head", temporal=True):
     # YOLO11-n is the 2026 sweet spot for CPU speed
     model = YOLO("./models/yolo11n.pt")
 
@@ -42,7 +50,13 @@ def anonify(input_path, output_path, mode="head", *, temporal=True):
 
     print(f"Starting Anonify | Mode: {mode} | Temporal: {temporal}")
 
-    for frame in tqdm(container.decode(video=0), total=video_stream.frames):
+    progress = tqdm(total=video_stream.frames, delay=math.nextafter(0, 1))
+    if is_subprocess():
+        progress.bar_format = "Processing frame: {n_fmt}/{total_fmt}"
+        progress.sp = print
+    progress.display()
+    for frame in container.decode(video=0):
+        progress.update(1)
         # Convert to OpenCV format
         img = frame.to_ndarray(format="bgr24")
         h, w, _ = img.shape
@@ -100,6 +114,8 @@ def anonify(input_path, output_path, mode="head", *, temporal=True):
             new_frame = av.VideoFrame.from_ndarray(result, format="bgr24")
             for packet in out_video.encode(new_frame):
                 out_container.mux(packet)
+    progress.sp = lambda _: None
+    progress.close()
 
     # 4. Copy Audio (Muxing)
     if audio_stream and out_audio:
@@ -119,19 +135,62 @@ def anonify(input_path, output_path, mode="head", *, temporal=True):
     print("Done.")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input", help="Input video")
-    parser.add_argument("--mode", choices=["head", "body"], default="head")
+def main():
+    parser = GooeyParser()
+    parser.add_argument("input", help="Input video", widget="FileChooser")
     parser.add_argument(
-        "--temporal", action="store_true", help="Enable Union Mask over 5 frames"
+        "--full-body",
+        action="store_true",
+        help="Anonymize full body instead of just head",
+        widget="BlockCheckbox",
     )
-    parser.add_argument("--output", default=None, help="Output video path")
+    parser.add_argument(
+        "--no-temporal",
+        action="store_true",
+        help="Disable Union Masking (over 5 frames)",
+        widget="BlockCheckbox",
+    )
+    parser.add_argument(
+        "--output-dir", default=None, help="Output video directory", widget="DirChooser"
+    )
     args = parser.parse_args()
 
-    if args.output is None:
-        # Generate a random output name using shortuuid
-        random_id = shortuuid.ShortUUID().random(length=6)
-        args.output = f"anon-{random_id}.mp4"
+    if args.output_dir is None:
+        args.output_dir = "./outputs"
+    Path(args.output_dir).mkdir(exist_ok=True, parents=True)
+    # Generate a random output name using shortuuid
+    random_id = shortuuid.ShortUUID().random(length=6)
+    args.output = Path(args.output_dir) / f"anon-{random_id}.mp4"
 
-    anonify(args.input, args.output, args.mode, temporal=args.temporal)
+    anonify(
+        args.input,
+        args.output,
+        mode="body" if args.full_body else "head",
+        temporal=not args.no_temporal,
+    )
+
+
+@Gooey(
+    program_name="Anonify - Video Anonymizer",
+    default_size=(600, 700),
+    advanced=True,
+    progress_regex=r"\bProcessing frame: (?P<current>\d+)/(?P<total>\d+)\b",
+    progress_expr="current / total * 100",
+    hide_progress_msg=True,
+    timing_options={
+        "show_time_remaining": True,
+        "hide_time_remaining_on_complete": True,
+    },
+    show_restart=False,
+)
+def main_gui():
+    main()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 or "--ignore-gooey" in sys.argv:
+        print("Running in CLI mode")
+        main()
+    else:
+        print("Running in GUI mode")
+        main_gui()
