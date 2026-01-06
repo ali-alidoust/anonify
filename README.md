@@ -1,5 +1,7 @@
 # Anonify - Video Anonymizer
 
+Languages: English | [فارسی](README_FA.md)
+
 Anonify is a desktop application that automatically anonymizes people in videos by blurring their faces or full bodies. It uses AI-powered person detection with temporal masking to create smooth, consistent anonymization across video frames.
 
 > [!CAUTION]
