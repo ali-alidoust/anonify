@@ -1,12 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_all
+
+datas = [('.\\models\\yolo11n_openvino_model\\yolo11n.bin', '.\\models\\yolo11n_openvino_model'), ('.\\models\\yolo11n_openvino_model\\yolo11n.xml', '.\\models\\yolo11n_openvino_model'), ('.\\models\\yolo11n_openvino_model\\metadata.yaml', '.\\models\\yolo11n_openvino_model')]
+binaries = []
+hiddenimports = []
+tmp_ret = collect_all('openvino')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
     ['src\\main.py'],
     pathex=[],
-    binaries=[],
-    datas=[('.\\models\\yolo11n.pt', '.\\models')],
-    hiddenimports=[],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

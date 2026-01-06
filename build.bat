@@ -4,4 +4,7 @@ uv run pyinstaller ./src/main.py ^
     --noconsole ^
     --icon .\assets\icon.ico ^
     --noupx ^
-    --add-data .\models\yolo11n.pt:.\models
+    --collect-all openvino ^
+    --add-data .\models\yolo11n_openvino_model\yolo11n.bin:.\models\yolo11n_openvino_model ^
+    --add-data .\models\yolo11n_openvino_model\yolo11n.xml:.\models\yolo11n_openvino_model ^
+    --add-data .\models\yolo11n_openvino_model\metadata.yaml:.\models\yolo11n_openvino_model
