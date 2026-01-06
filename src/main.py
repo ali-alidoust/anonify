@@ -10,9 +10,34 @@ from av.container.input import InputContainer
 import cv2
 from gooey import Gooey, GooeyParser
 import numpy as np
+import openvino.runtime as ov
+from sahi.models.ultralytics import UltralyticsDetectionModel
+from sahi.predict import get_sliced_prediction
 import shortuuid
 from tqdm import tqdm
 from ultralytics.models.yolo import YOLO
+
+
+# Store the original compile_model function
+original_compile_model = ov.Core.compile_model
+
+
+# Define a "hacked" version that always forces THROUGHPUT
+def hacked_compile_model(self, model, device_name=None, config=None, *, weights=None):
+    print("Applying OpenVINO PERFORMANCE_HINT=THROUGHPUT for CPU inference")
+    if config is None:
+        config = {}
+    # Force the hint regardless of what Ultralytics wants
+    config["PERFORMANCE_HINT"] = "THROUGHPUT"
+    config["NUM_STREAMS"] = "AUTO"
+    config["INFERENCE_NUM_THREADS"] = "8"
+    return original_compile_model(
+        self, model, device_name, config=config, weights=weights
+    )
+
+
+# Apply the patch
+ov.Core.compile_model = hacked_compile_model
 
 
 def is_subprocess():
@@ -25,14 +50,19 @@ def print_with_flush(*args, **kwargs):
 
 
 def anonify(input_path, output_path, *, mode="head", temporal=True, threshold=0.25):
-    model_path = "./models/yolo11n.pt"
+    model_path = "./models/yolo11n_openvino_model"
     # If we are using pyinstaller, adjust the model path
     if getattr(sys, "frozen", False):
         base_path = sys._MEIPASS  # pyright: ignore[reportAttributeAccessIssue] # noqa: SLF001
-        model_path = Path(base_path) / "models" / "yolo11n.pt"
+        model_path = Path(base_path) / "models" / "yolo11n_openvino_model"
 
-    # YOLO11-n is the 2026 sweet spot for CPU speed
-    model = YOLO(model_path)
+    ov_model = YOLO(model_path, task="detect")
+    model = UltralyticsDetectionModel(
+        model=ov_model,
+        device="cpu",
+        confidence_threshold=threshold,
+        image_size=640,
+    )
 
     # 1. Open Input with PyAV
     container = av.open(input_path, mode="r")
@@ -66,28 +96,34 @@ def anonify(input_path, output_path, *, mode="head", temporal=True, threshold=0.
         progress.bar_format = "Processing frame: {n_fmt}/{total_fmt}"
         progress.sp = print_with_flush
     progress.display()
-    for frame in container.decode(video=0):
+
+    def frame_generator():
+        for frame in container.decode(video=0):
+            # Convert to OpenCV format
+            yield frame.to_ndarray(format="bgr24")
+
+    h, w = video_stream.height, video_stream.width
+
+    for frame in frame_generator():
+        results = get_sliced_prediction(
+            frame,
+            model,
+            slice_height=960,
+            slice_width=960,
+            overlap_height_ratio=0.1,
+            overlap_width_ratio=0.1,
+            perform_standard_pred=True,
+            verbose=0,
+        )
         progress.update(1)
-        # Convert to OpenCV format
-        img = frame.to_ndarray(format="bgr24")
-        h, w, _ = img.shape
 
         # 1. Read Frame and Create Mask
         mask = np.zeros((h, w), dtype=np.uint8)
-        # Limit imgsz to file size to avoid excessive memory use
-        imgsz = min(2048, max(h, w))
-        # Higher imgsz improves detection of small/distant heads
-        results = model.predict(
-            img, classes=[0], conf=threshold, verbose=False, imgsz=imgsz
-        )
 
-        if len(results) != 1:
-            raise ValueError("Expected a single result per frame")
-        if results[0].boxes is None:
-            raise ValueError("No boxes detected")
-
-        for box in results[0].boxes:
-            bx1, by1, bx2, by2 = map(int, box.xyxy[0])
+        for result in results.object_prediction_list:
+            if result.category.id != 0:
+                continue  # Only process person class
+            bx1, by1, bx2, by2 = map(int, result.bbox.to_xyxy())
             if mode == "head":
                 cx = bx1 + (bx2 - bx1) // 2
                 # Approximate heads using 80% width, 40% height
@@ -98,7 +134,7 @@ def anonify(input_path, output_path, *, mode="head", temporal=True, threshold=0.
 
             cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
 
-        frame_buffer.append(img)
+        frame_buffer.append(frame)
         mask_buffer.append(mask)
 
         # 2. Process and Write the middle frame of the buffer
@@ -127,6 +163,7 @@ def anonify(input_path, output_path, *, mode="head", temporal=True, threshold=0.
             new_frame = av.VideoFrame.from_ndarray(result, format="bgr24")
             for packet in out_video.encode(new_frame):
                 out_container.mux(packet)
+
     progress.sp = lambda _: None
     progress.close()
 
