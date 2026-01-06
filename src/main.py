@@ -150,28 +150,50 @@ def anonify(input_path, output_path, *, mode="head", temporal=True, threshold=0.
 
 def main():
     parser = GooeyParser()
-    parser.add_argument("input", help="Input video", widget="FileChooser")
+    parser.add_argument(
+        "input",
+        help="Path to video file",
+        widget="FileChooser",
+        metavar="Input Video",
+        gooey_options={"full_width": True},
+    )
     parser.add_argument(
         "--full-body",
         action="store_true",
-        help="Anonymize full body instead of just head",
+        help="Blur full body instead of just head",
         widget="BlockCheckbox",
+        metavar="Anonymize Full Body",
+        gooey_options={},
     )
     parser.add_argument(
         "--no-temporal",
         action="store_true",
-        help="Disable Union Masking (over 5 frames)",
+        help="Only anonymize current frame (no temporal smoothing)",
         widget="BlockCheckbox",
+        metavar="Disable Temporal Masking",
+        gooey_options={},
     )
     parser.add_argument(
         "--detection-rate",
         type=float,
         default=75,
-        help="Detection rate. Higher values increase detection sensitivity but may slow processing. (0-100)",
+        help="Sensitivity of detection (higher = more detections)",
         widget="Slider",
+        metavar="Detection Rate (%)",
+        gooey_options={
+            "full_width": True,
+            "min": 0,
+            "max": 100,
+            "step": 1,
+        },
     )
     parser.add_argument(
-        "--output-dir", default=None, help="Output video directory", widget="DirChooser"
+        "--output-dir",
+        default=None,
+        help="Your video file will be saved here. If not specified, '.\\outputs' will be created and used.",
+        widget="DirChooser",
+        metavar="Output Directory",
+        gooey_options={"full_width": True},
     )
     args = parser.parse_args()
 
@@ -202,7 +224,7 @@ def main():
         "show_time_remaining": True,
         "hide_time_remaining_on_complete": True,
     },
-    show_restart=False,
+    show_restart_button=False,
 )
 def main_gui():
     main()
