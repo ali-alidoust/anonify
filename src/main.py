@@ -19,7 +19,12 @@ def is_subprocess():
     return "GOOEY" in os.environ and os.environ["GOOEY"] == "1"
 
 
-def anonify(input_path, output_path, *, mode="head", temporal=True):
+def print_with_flush(*args, **kwargs):
+    print(*args, **kwargs)
+    sys.stdout.flush()
+
+
+def anonify(input_path, output_path, *, mode="head", temporal=True, threshold=0.25):
     model_path = "./models/yolo11n.pt"
     # If we are using pyinstaller, adjust the model path
     if getattr(sys, "frozen", False):
@@ -59,7 +64,7 @@ def anonify(input_path, output_path, *, mode="head", temporal=True):
     progress = tqdm(total=video_stream.frames, delay=math.nextafter(0, 1))
     if is_subprocess():
         progress.bar_format = "Processing frame: {n_fmt}/{total_fmt}"
-        progress.sp = print
+        progress.sp = print_with_flush
     progress.display()
     for frame in container.decode(video=0):
         progress.update(1)
@@ -72,7 +77,9 @@ def anonify(input_path, output_path, *, mode="head", temporal=True):
         # Limit imgsz to file size to avoid excessive memory use
         imgsz = min(2048, max(h, w))
         # Higher imgsz improves detection of small/distant heads
-        results = model.predict(img, classes=[0], conf=0.10, verbose=False, imgsz=imgsz)
+        results = model.predict(
+            img, classes=[0], conf=threshold, verbose=False, imgsz=imgsz
+        )
 
         if len(results) != 1:
             raise ValueError("Expected a single result per frame")
@@ -157,6 +164,13 @@ def main():
         widget="BlockCheckbox",
     )
     parser.add_argument(
+        "--detection-rate",
+        type=float,
+        default=75,
+        help="Detection rate. Higher values increase detection sensitivity but may slow processing. (0-100)",
+        widget="Slider",
+    )
+    parser.add_argument(
         "--output-dir", default=None, help="Output video directory", widget="DirChooser"
     )
     args = parser.parse_args()
@@ -173,6 +187,7 @@ def main():
         args.output,
         mode="body" if args.full_body else "head",
         temporal=not args.no_temporal,
+        threshold=1.0 - (args.detection_rate / 100.0),
     )
 
 
@@ -195,8 +210,6 @@ def main_gui():
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 or "--ignore-gooey" in sys.argv:
-        print("Running in CLI mode")
         main()
     else:
-        print("Running in GUI mode")
         main_gui()
