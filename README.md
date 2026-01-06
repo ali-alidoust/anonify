@@ -7,6 +7,8 @@ Anonify is a desktop application that automatically anonymizes people in videos 
 > [!CAUTION]
 > You should ALWAYS double-check the resulting video for faces. AI is not perfect.
 
+![demo](./docs/demo.gif)
+
 ## Features
 
 - **Smart Detection**: Uses YOLO11n AI model for accurate person detection
