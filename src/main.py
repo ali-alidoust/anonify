@@ -435,6 +435,13 @@ def main_gui():
 
 
 if __name__ == "__main__":
+    try:
+        import pyi_splash
+
+        pyi_splash.close()
+    except ImportError:
+        pass
+
     if len(sys.argv) > 1 or "--ignore-gooey" in sys.argv:
         main()
     else:

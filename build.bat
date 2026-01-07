@@ -3,6 +3,7 @@ uv run pyinstaller ./src/main.py ^
     --onefile ^
     --noconsole ^
     --icon .\assets\icon.ico ^
+    --splash .\assets\splash.png ^
     --noupx ^
     --collect-all openvino ^
     --add-data .\models\yolo11n_openvino_model\yolo11n.bin:.\models\yolo11n_openvino_model ^
