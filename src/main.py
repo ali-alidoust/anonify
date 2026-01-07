@@ -1,5 +1,7 @@
 from collections import deque
-import math
+import heapq
+import itertools
+import multiprocessing
 import os
 from pathlib import Path
 import secrets
@@ -10,7 +12,7 @@ from av.container.input import InputContainer
 import cv2
 from gooey import Gooey, GooeyParser
 import numpy as np
-import openvino.runtime as ov
+import openvino as ov
 from sahi.models.ultralytics import UltralyticsDetectionModel
 from sahi.predict import get_sliced_prediction
 import shortuuid
@@ -40,71 +42,63 @@ def hacked_compile_model(self, model, device_name=None, config=None, *, weights=
 ov.Core.compile_model = hacked_compile_model
 
 
-def is_subprocess():
-    return "GOOEY" in os.environ and os.environ["GOOEY"] == "1"
-
-
-def print_with_flush(*args, **kwargs):
-    print(*args, **kwargs)
-    sys.stdout.flush()
-
-
-def anonify(input_path, output_path, *, mode="head", temporal=True, threshold=0.25):
-    model_path = "./models/yolo11n_openvino_model"
-    # If we are using pyinstaller, adjust the model path
-    if getattr(sys, "frozen", False):
-        base_path = sys._MEIPASS  # pyright: ignore[reportAttributeAccessIssue] # noqa: SLF001
-        model_path = Path(base_path) / "models" / "yolo11n_openvino_model"
-
+def load_model(*, model_path: str, threshold: float) -> UltralyticsDetectionModel:
     ov_model = YOLO(model_path, task="detect")
-    model = UltralyticsDetectionModel(
+    return UltralyticsDetectionModel(
         model=ov_model,
         device="cpu",
         confidence_threshold=threshold,
         image_size=640,
     )
 
+
+def producer_task(*, input_queue, input_path, num_consumers, limit_sem):
     # 1. Open Input with PyAV
     container = av.open(input_path, mode="r")
     if not isinstance(container, InputContainer):
         raise TypeError("Failed to open input video")
-    video_stream = container.streams.video[0]
-    audio_stream = container.streams.audio[0] if container.streams.audio else None
 
-    # 2. Setup Output
-    out_container = av.open(output_path, mode="w")
-    out_video = out_container.add_stream("libx264", rate=video_stream.average_rate)
-    out_video.width = video_stream.width
-    out_video.height = video_stream.height
-    out_video.pix_fmt = "yuv420p"
+    if not container.streams.video:
+        raise ValueError("Input video has no video stream")
 
-    out_audio = None
-    if audio_stream:
-        out_audio = out_container.add_stream(
-            audio_stream.codec.name, rate=audio_stream.rate
-        )
+    w = container.streams.video[0].width
+    h = container.streams.video[0].height
 
-    # Buffer for Temporal Union (Window of 5 frames: -2, -1, 0, +1, +2)
-    window_size = 5 if temporal else 1
-    frame_buffer = deque(maxlen=window_size)
-    mask_buffer = deque(maxlen=window_size)
+    idx = 0
+    for idx, frame in enumerate(container.decode(video=0)):
+        # --- CRITICAL STEP ---
+        # Block here if the system is full.
+        # This prevents flooding the queues/RAM.
+        limit_sem.acquire()
 
-    print(f"Starting Anonify | Mode: {mode} | Temporal: {temporal}")
+        # Convert to OpenCV format
+        input_queue.put((idx, frame.to_ndarray(format="bgr24"), w, h))
 
-    progress = tqdm(total=video_stream.frames, delay=math.nextafter(0, 1))
-    if is_subprocess():
-        progress.bar_format = "Processing frame: {n_fmt}/{total_fmt}"
-        progress.sp = print_with_flush
-    progress.display()
+    # Release semaphore slot after putting frame in queue
+    limit_sem.release()
 
-    def frame_generator():
-        for frame in container.decode(video=0):
-            # Convert to OpenCV format
-            yield frame.to_ndarray(format="bgr24")
+    container.close()
 
-    h, w = video_stream.height, video_stream.width
+    for _ in range(num_consumers):
+        input_queue.put(None)
 
-    for frame in frame_generator():
+
+def processor_task(
+    *,
+    input_queue: multiprocessing.Queue,
+    processed_queue,
+    model_path,
+    mode,
+    threshold,
+):
+    model = load_model(model_path=model_path, threshold=threshold)
+    while True:
+        item = input_queue.get()
+        if item is None:
+            processed_queue.put(None)
+            break
+
+        idx, frame, w, h = item
         results = get_sliced_prediction(
             frame,
             model,
@@ -115,7 +109,6 @@ def anonify(input_path, output_path, *, mode="head", temporal=True, threshold=0.
             perform_standard_pred=True,
             verbose=0,
         )
-        progress.update(1)
 
         # 1. Read Frame and Create Mask
         mask = np.zeros((h, w), dtype=np.uint8)
@@ -134,40 +127,129 @@ def anonify(input_path, output_path, *, mode="head", temporal=True, threshold=0.
 
             cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
 
-        frame_buffer.append(frame)
-        mask_buffer.append(mask)
+        processed_queue.put((idx, frame, mask))
 
-        # 2. Process and Write the middle frame of the buffer
-        if len(frame_buffer) == window_size:
-            # Target the middle frame (M0)
-            target_frame = frame_buffer[len(frame_buffer) // 2]
 
-            # 1. TEMPORAL UNION: Merge M(-2) through M(+2)
-            union_mask = np.zeros((h, w), dtype=np.uint8)
-            for m in mask_buffer:
-                union_mask = cv2.bitwise_or(union_mask, m)
+def output_task(
+    *, processed_queue, temporal, input_path, output_path, avg_rate, limit_sem
+):
+    window_size = 5 if temporal else 1
+    frame_buffer = deque()
+    mask_buffer = deque()
 
-            if np.any(union_mask):
-                # 2. TEMPORAL JITTER: Randomize kernel size to defeat AI unblurring
-                # Kernel must be odd: 91, 93, 95... up to 121
-                jitter = secrets.randbelow(16) * 2 + 91
-                blurred_frame = cv2.GaussianBlur(target_frame, (jitter, jitter), 30)
+    heap = []
+    idx_expected = 0
 
-                # 3. MASK STITCHING: Replace pixels
-                mask_3ch = cv2.merge([union_mask] * 3)
-                result = np.where(mask_3ch == 255, blurred_frame, target_frame)
-            else:
-                result = target_frame
+    container = av.open(input_path, mode="r")
+    if not isinstance(container, InputContainer):
+        raise TypeError("Failed to open input video")
 
-            # 4. Encode Video Frame
-            new_frame = av.VideoFrame.from_ndarray(result, format="bgr24")
-            for packet in out_video.encode(new_frame):
-                out_container.mux(packet)
+    if not container.streams.video:
+        raise ValueError("Input video has no video stream")
 
-    progress.sp = lambda _: None
-    progress.close()
+    w = container.streams.video[0].width
+    h = container.streams.video[0].height
 
-    # 4. Copy Audio (Muxing)
+    audio_stream = container.streams.audio[0] if container.streams.audio else None
+
+    progress = tqdm(total=container.streams.video[0].frames)
+
+    progress.display()
+
+    # Setup Output
+    out_container = av.open(output_path, mode="w")
+    out_video = out_container.add_stream("libx264", rate=avg_rate)
+    out_video.width = w
+    out_video.height = h
+    out_video.pix_fmt = "yuv420p"
+    out_video.time_base = container.streams.video[0].time_base
+
+    # Get input video bitrate
+    if input_bitrate := container.streams.video[0].bit_rate:
+        out_video.bit_rate = input_bitrate
+
+    # Setup audio stream if present
+    out_audio = None
+    if audio_stream:
+        out_audio = out_container.add_stream(
+            audio_stream.codec.name, rate=audio_stream.rate
+        )
+        out_audio.time_base = audio_stream.time_base
+
+    tiebreaker = itertools.count()
+    frame_pts = 0
+
+    def filter_and_encode(frame_idx, pop=True):
+        nonlocal frame_pts
+        target_frame = frame_buffer[frame_idx]
+
+        # 1. TEMPORAL UNION: Merge M(-2) through M(+2)
+        union_mask = np.zeros((h, w), dtype=np.uint8)
+        for m_idx in range(min(window_size, len(mask_buffer))):
+            m = mask_buffer[m_idx]
+            union_mask = cv2.bitwise_or(union_mask, m)
+
+        if np.any(union_mask):
+            # 2. TEMPORAL JITTER: Randomize kernel size to defeat AI unblurring
+            # Kernel must be odd: 91, 93, 95... up to 121
+            jitter = secrets.randbelow(16) * 2 + 91
+            blurred_frame = cv2.GaussianBlur(target_frame, (jitter, jitter), 30)
+
+            # 3. MASK STITCHING: Replace pixels
+            mask_3ch = cv2.merge([union_mask] * 3)
+            result = np.where(mask_3ch == 255, blurred_frame, target_frame)
+        else:
+            result = target_frame
+
+        progress.update(1)
+
+        # 4. Encode Video Frame
+        new_frame = av.VideoFrame.from_ndarray(result, format="bgr24")
+        new_frame.pts = frame_pts
+        frame_pts += 1
+        for packet in out_video.encode(new_frame):
+            out_container.mux(packet)
+
+        if pop:
+            frame_buffer.popleft()
+            mask_buffer.popleft()
+
+    while True:
+        item = processed_queue.get()
+        if item is None:
+            break
+
+        idx, frame, mask = item
+        heapq.heappush(heap, (idx, next(tiebreaker), frame, mask))
+        # Process frames in order
+        while heap and heap[0][0] == idx_expected:
+            idx, _, frame, mask = heapq.heappop(heap)
+            idx_expected += 1
+
+            frame_buffer.append(frame)
+            mask_buffer.append(mask)
+
+            limit_sem.release()
+
+            if idx < window_size // 2:
+                while len(frame_buffer) > idx + 1:
+                    # Not enough previous frames to form full window
+                    filter_and_encode(0, pop=False)
+
+            while len(frame_buffer) >= window_size:
+                # Target the middle frame (M0)
+                filter_and_encode(window_size // 2)
+
+    # After producer is done, process remaining frames
+    # Process remaining frames in buffer with available window
+    for idx in range(len(frame_buffer)):
+        filter_and_encode(idx, pop=False)
+
+    # Flush video encoder before copying audio
+    for packet in out_video.encode():
+        out_container.mux(packet)
+
+    # Copy Audio (Muxing)
     if audio_stream and out_audio:
         container.seek(0)  # Reset to beginning
         for packet in container.demux(audio_stream):
@@ -176,13 +258,91 @@ def anonify(input_path, output_path, *, mode="head", temporal=True, threshold=0.
             packet.stream = out_audio
             out_container.mux(packet)
 
-    # 5. Flush encoders
-    for packet in out_video.encode():
-        out_container.mux(packet)
     out_container.close()
     container.close()
 
-    print("Done.")
+
+def is_subprocess():
+    return "GOOEY" in os.environ and os.environ["GOOEY"] == "1"
+
+
+def print_with_flush(*args, **kwargs):
+    print(*args, **kwargs)
+    sys.stdout.flush()
+
+
+NUM_CONSUMERS = 4
+
+
+def anonify(*, input_path, output_path, model_path, mode, temporal, threshold):
+    multiprocessing.freeze_support()
+
+    # Detect input video frame rate
+    container = av.open(input_path, mode="r")
+    if not isinstance(container, InputContainer):
+        raise TypeError("Failed to open input video")
+
+    if not container.streams.video:
+        raise ValueError("Input video has no video stream")
+
+    input_fps = container.streams.video[0].average_rate
+    container.close()
+
+    limit_semaphore = multiprocessing.Semaphore(NUM_CONSUMERS * 5)
+
+    input_queue = multiprocessing.Queue(maxsize=NUM_CONSUMERS * 5)
+    processed_queue = multiprocessing.Queue(maxsize=NUM_CONSUMERS * 5)
+
+    processors = []
+
+    # Producer
+    producer = multiprocessing.Process(
+        target=producer_task,
+        kwargs={
+            "input_queue": input_queue,
+            "input_path": input_path,
+            "num_consumers": NUM_CONSUMERS,
+            "limit_sem": limit_semaphore,
+        },
+    )
+
+    for _ in range(NUM_CONSUMERS):
+        processor = multiprocessing.Process(
+            target=processor_task,
+            kwargs={
+                "input_queue": input_queue,
+                "processed_queue": processed_queue,
+                "model_path": model_path,
+                "mode": mode,
+                "threshold": threshold,
+            },
+        )
+        processors.append(processor)
+
+    # Output
+    encoder = multiprocessing.Process(
+        target=output_task,
+        kwargs={
+            "processed_queue": processed_queue,
+            "temporal": temporal,
+            "input_path": input_path,
+            "output_path": output_path,
+            "avg_rate": input_fps,
+            "limit_sem": limit_semaphore,
+        },
+    )
+
+    # Start Processes
+    producer.start()
+    encoder.start()
+    for p in processors:
+        p.start()
+
+    # Wait for completion
+    producer.join()
+    for p in processors:
+        p.join()
+    encoder.join()
 
 
 def main():
@@ -241,9 +401,16 @@ def main():
     random_id = shortuuid.ShortUUID().random(length=6)
     args.output = Path(args.output_dir) / f"anon-{random_id}.mp4"
 
+    base_path = "."
+    if is_subprocess() and getattr(sys, "frozen", False):
+        base_path = sys._MEIPASS  # pyright: ignore[reportAttributeAccessIssue] # noqa: SLF001
+
+    model_root = Path(base_path) / "models"
+
     anonify(
-        args.input,
-        args.output,
+        input_path=args.input,
+        output_path=args.output,
+        model_path=str(model_root / "yolo11n_openvino_model"),
         mode="body" if args.full_body else "head",
         temporal=not args.no_temporal,
         threshold=1.0 - (args.detection_rate / 100.0),
